@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"unicode/utf8"
+	"runtime"
 )
 
 type LineReader interface {
@@ -22,6 +23,7 @@ var (
 	inputFile   = flag.String("i", "", "/path/to/input.json (optional; default is stdin)")
 	outputFile  = flag.String("o", "", "/path/to/output.json (optional; default is stdout)")
 	outputDelim = flag.String("d", ",", "delimiter used for output values")
+	nThreads    = flag.Int("t", -1, "Max number of threads (optional; deafult is number of cpus)")
 	verbose     = flag.Bool("v", false, "verbose output (to stderr)")
 	showVersion = flag.Bool("version", false, "print version string")
 	printHeader = flag.Bool("p", false, "prints header to output")
@@ -35,8 +37,15 @@ func init() {
 func main() {
 	flag.Parse()
 
+	// GOMAXPROCS(0) doesn't do anything so environment variable etc
+	// wont be overriden if -t 0 is given
+	if *nThreads < 0 {
+		*nThreads = runtime.NumCPU()
+	}
+	runtime.GOMAXPROCS(*nThreads)
+
 	if *showVersion {
-		fmt.Printf("json2csv v1.1\n")
+		fmt.Printf("json2csv v1.1-parallel\n")
 		return
 	}
 
@@ -93,46 +102,79 @@ func get_value(data map[string]interface{}, keyparts []string) string {
 	return ""
 }
 
-func json2csv(r LineReader, w *csv.Writer, keys []string, printHeader bool) {
-	var line []byte
-	var err error
+func futureUnmarshal(line []byte, line_count int) chan map[string]interface{}{
+	c := make (chan map[string]interface{})
 
+	go func(){
+		defer close(c)
+
+		var data map[string]interface{}
+		err := json.Unmarshal(line, &data)
+		if err != nil {
+			log.Printf("ERROR Decoding JSON at line %d: %s\n%s", line_count, err, line)
+			return
+		}
+		c <- data
+	}()
+
+	return c
+}
+
+func jsonIterator(r LineReader, keys []string) <- chan chan map[string]interface{} {
+	ch := make(chan chan map[string]interface{}, 1000)
+
+	go func(){
+		defer close(ch)
+
+		var err error
+		var line []byte
+		line_count := 0
+
+		for{
+			if err == io.EOF{
+				break
+			}
+
+			line, err = r.ReadBytes('\n')
+			line_count++
+			if err != nil && err != io.EOF {
+				log.Printf("Input Error: %s", err)
+				break
+			}
+			if len(line) == 0 {
+				continue
+			}
+
+			ch <- (futureUnmarshal(line, line_count))
+		}
+	}()
+
+	return ch
+}
+
+func json2csv(r LineReader, w *csv.Writer, keys []string, printHeader bool) {
 	var expanded_keys [][]string
 	for _, key := range keys {
 		expanded_keys = append(expanded_keys, strings.Split(key, "."))
 	}
+	var n_keys = len(expanded_keys)
+	var record = make([]string, n_keys)
 
-	for {
-		if err == io.EOF {
-			return
-		}
-		line, err = r.ReadBytes('\n')
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("Input ERROR: %s", err)
-				break
-			}
-		}
-		if len(line) == 0 {
+	if printHeader {
+		w.Write(keys)
+		w.Flush()
+	}
+
+	for chandata := range jsonIterator(r, keys) {
+		data := <-chandata
+
+		// JSON error, skip
+		if data == nil {
 			continue
 		}
 
-		if printHeader {
-			w.Write(keys)
-			w.Flush()
-			printHeader = false
-		}
-
-		var data map[string]interface{}
-		err = json.Unmarshal(line, &data)
-		if err != nil {
-			log.Printf("ERROR Json Decoding: %s - %v", err, line)
-			continue
-		}
-
-		var record []string
-		for _, expanded_key := range expanded_keys {
-			record = append(record, get_value(data, expanded_key))
+		for i, expanded_key := range expanded_keys {
+			record[i] = get_value(data, expanded_key)
 		}
 
 		w.Write(record)
